@@ -21,7 +21,20 @@ const demo = await read("/api/player?source=demo");
 assert.equal(demo.status, 200);
 assert.equal(demo.data.source, "demo");
 assert.equal(demo.data.matches.length, 20);
+assert.equal(demo.data.ranked.seasonId, 41);
+assert.equal(demo.data.season.id, 41);
+assert.equal(demo.data.seasons[0].startDate, "2026-08-13");
+assert.ok(demo.data.ranked.rp > 0);
+assert.equal(demo.data.matches[0].details.equipment.length, 5);
+assert.equal(typeof demo.data.matches[0].details.vision, "number");
+assert.equal(typeof demo.data.matches[0].details.animalDamage, "number");
+assert.equal(demo.data.matches[3].details.escapeState, 3);
+assert.equal(demo.data.matches[7].details.escapeState, 2);
+assert.equal(demo.data.matches[0].details.rpAfter, demo.data.ranked.rp);
 assert.equal((await read("/api/player?nickname=&source=live")).status, 400);
+assert.equal((await read("/api/player?source=demo&season=-1")).status, 400);
+assert.equal((await read("/api/player/history?id=bad&cursor=1")).status, 400);
+assert.equal((await read("/api/player/history?id=11111111-1111-4111-8111-111111111111&cursor=1")).status, 409);
 if (!config.data.gameApiConfigured)
   assert.equal(
     (await read("/api/player?nickname=test&source=live")).status,
@@ -33,6 +46,7 @@ const body = {
   mode: "normal",
   character: "all",
   focus: "survival",
+  seasonId: 41,
 };
 const options = {
   method: "POST",

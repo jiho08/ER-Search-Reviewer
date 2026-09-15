@@ -19,7 +19,6 @@ import {
   Sparkles,
   Swords,
   Target,
-  Trophy,
   X,
 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -42,9 +41,10 @@ import {
   CharacterBadge,
   MatchRow,
   ReviewContent,
-  Sparkline,
 } from "@/components/dashboard-parts";
+import { RankedCard, RPChart, DetailedMetrics, CharacterTable } from "@/components/player-overview";
 import { createDemoData } from "@/lib/demo";
+import { mergeMatches } from "@/lib/season-history";
 import {
   characterStats,
   filterMatches,
@@ -53,6 +53,7 @@ import {
 } from "@/lib/analysis";
 import type {
   AppConfig,
+  HistoryPage,
   MatchMode,
   PlayerData,
   ReviewFocus,
@@ -75,6 +76,10 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState("");
+  const historyRequestId = useRef(0);
+  const historyAbort = useRef<AbortController | null>(null);
   const [mode, setMode] = useState<MatchMode>("all");
   const [character, setCharacter] = useState("all");
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -93,7 +98,8 @@ export default function Home() {
   const stats = summarize(filtered),
     characters = characterStats(player.matches),
     filteredCharacters = characterStats(filtered);
-  const isAI = player.source === "live" && config?.aiConfigured;
+  const isCodex = config?.aiProvider === "codex" && config.aiConfigured;
+  const isAI = isCodex || (player.source === "live" && config?.aiConfigured);
   useEffect(() => {
     fetch("/api/config")
       .then((r) => r.json() as Promise<AppConfig>)
@@ -106,15 +112,53 @@ export default function Home() {
     setReviewing(false);
     setReviewError("");
   }, []);
+  const stopHistory = useCallback(() => {
+    historyRequestId.current++;
+    historyAbort.current?.abort();
+    setHistoryLoading(false);
+  }, []);
+  useEffect(() => () => {
+    requestId.current++;
+    historyRequestId.current++;
+    historyAbort.current?.abort();
+  }, []);
+  const loadSeasonHistory = useCallback(async (initial: PlayerData, searchId: number) => {
+    if (!initial.history?.next) return;
+    const run = ++historyRequestId.current;
+    historyAbort.current?.abort();
+    const controller = new AbortController();
+    historyAbort.current = controller;
+    resetReview();
+    setHistoryLoading(true);
+    setHistoryError("");
+    let current = initial;
+    try {
+      while (current.history?.next) {
+        const response = await fetch(`/api/player/history?id=${encodeURIComponent(current.history.id)}&cursor=${encodeURIComponent(current.history.next)}`, { signal: controller.signal });
+        const page = await response.json() as HistoryPage & { error?: string };
+        if (!response.ok) throw new Error(page.error || "이전 경기를 불러오지 못했습니다.");
+        if (run !== historyRequestId.current || searchId !== requestId.current) return;
+        current = { ...current, matches: mergeMatches(current.matches, page.matches), history: page.history };
+        setPlayer(current);
+      }
+    } catch (err) {
+      if (!controller.signal.aborted && run === historyRequestId.current && searchId === requestId.current)
+        setHistoryError(err instanceof Error ? err.message : "이전 경기 조회에 실패했습니다.");
+    } finally {
+      if (run === historyRequestId.current && searchId === requestId.current) setHistoryLoading(false);
+    }
+  }, [resetReview]);
   const search = useCallback(
-    async (nickname: string, demo = false, refresh = false) => {
+    async (nickname: string, demo = false, refresh = false, seasonId?: number) => {
       const id = ++requestId.current;
+      stopHistory();
+      setHistoryError("");
       resetReview();
       setLoading(true);
       setError("");
       try {
         const response = await fetch(
-          `/api/player?nickname=${encodeURIComponent(nickname.trim())}&source=${demo ? "demo" : "live"}${refresh ? "&refresh=1" : ""}`,
+          `/api/player?nickname=${encodeURIComponent(nickname.trim())}&source=${demo ? "demo" : "live"}${refresh ? "&refresh=1" : ""}${seasonId ? `&season=${seasonId}` : ""}`,
         );
         const data = (await response.json()) as PlayerData & { error?: string };
         if (!response.ok)
@@ -127,6 +171,7 @@ export default function Home() {
           setExpanded(null);
           setVisibleCount(6);
         });
+        void loadSeasonHistory(data, id);
         return {
           ok: true,
           nickname: data.nickname,
@@ -142,7 +187,7 @@ export default function Home() {
         if (id === requestId.current) setLoading(false);
       }
     },
-    [resetReview],
+    [resetReview, stopHistory, loadSeasonHistory],
   );
   useEffect(() => {
     const context = (
@@ -217,6 +262,10 @@ export default function Home() {
           mode,
           character,
           focus,
+          codexTest: Boolean(isCodex && player.source === "demo"),
+          seasonId: player.season?.id,
+          historyId: player.history?.id,
+          historyPages: player.history?.pages,
         }),
       });
       const data = (await response.json()) as ReviewResult & { error?: string };
@@ -399,8 +448,7 @@ export default function Home() {
           aria-busy={loading}
         >
           <div className="profile-avatar">
-            <Crosshair size={35} />
-            <span>ER</span>
+            <CharacterBadge code={characters[0]?.code ?? 0} name={characters[0]?.name ?? "ER"} />
           </div>
           <div className="profile-text">
             <div className="profile-name">
@@ -414,7 +462,7 @@ export default function Home() {
                 조회된 경기 <strong>{player.matches.length}</strong>
               </span>
               <span className="separator">/</span>
-              {player.source === "demo" ? "가상 스쿼드 전적" : "최근 전적 기준"}
+              {player.source === "demo" ? "가상 스쿼드 전적" : player.season?.name ?? "조회된 전적 기준"}
             </p>
           </div>
           <button
@@ -422,13 +470,40 @@ export default function Home() {
             aria-label="전적 새로고침"
             disabled={loading}
             onClick={() =>
-              void search(player.nickname, player.source === "demo", true)
+              void search(player.nickname, player.source === "demo", true, player.season?.id)
             }
           >
             <RefreshCw size={15} className={loading ? "spin" : ""} />
             전적 새로고침
           </button>
         </section>
+        <section className="season-history-bar" aria-label="시즌 선택과 전적 조회">
+          <div className="season-history-controls">
+            <Select value={String(player.season?.id ?? "unknown")} disabled={loading || !player.seasons?.length}
+              onValueChange={(value) => void search(player.nickname, player.source === "demo", false, Number(value))}>
+              <SelectTrigger aria-label="전적 시즌" className="season-select"><SelectValue placeholder="시즌 확인 대기" /></SelectTrigger>
+              <SelectContent>{player.seasons?.length ? player.seasons.map((season) =>
+                <SelectItem key={season.id} value={String(season.id)}>{season.name}{season.isCurrent ? " · 현재" : ""}</SelectItem>
+              ) : <SelectItem value="unknown">시즌 확인 대기</SelectItem>}</SelectContent>
+            </Select>
+            <span className="history-status" role="status">
+              {historyLoading && <LoaderCircle size={15} className="spin" />}
+              {historyLoading ? "시즌 기록 불러오는 중" : player.source === "demo" ? "가상 기록" : player.history?.exhausted ? "조회 가능한 기록을 모두 불러왔습니다" : "일부 기록을 불러왔습니다"}
+              <strong>{player.matches.length.toLocaleString("ko-KR")}경기</strong>
+            </span>
+            {historyLoading ? <button className="history-action" onClick={stopHistory}>일시 중지</button>
+              : player.history?.next && <button className="history-action" disabled={loading} onClick={() => void loadSeasonHistory(player, requestId.current)}>이어서 불러오기</button>}
+          </div>
+          <p>랭크 스쿼드 {player.matches.filter((m) => m.mode === 3 && m.teamMode === 3).length.toLocaleString("ko-KR")}경기 확보
+            {player.ranked?.totalGames !== null && player.ranked?.totalGames !== undefined && <> / 시즌 누적 {player.ranked.totalGames.toLocaleString("ko-KR")}경기</>}
+            {player.season?.startDate && <> · {player.season.startDate} ~ {player.season.isCurrent ? "현재" : player.season.endDate ?? "종료일 미제공"}</>}
+          </p>
+          <p className="history-coverage-note">{player.source === "demo"
+            ? "누적 성적과 상세 경기는 모두 가상 예시입니다. 실제 전적에서는 선택한 시즌의 제공 가능한 기록을 불러옵니다."
+            : "시즌 누적 성적은 공식 집계입니다. 그래프·상세 지표·실험체별 성적은 불러온 경기로 계산하며, 90일 이전과 닉네임 변경 전 기록은 제공되지 않을 수 있습니다."}</p>
+          {historyError && <p className="history-error" role="alert">{historyError} 확보한 기록은 유지됩니다.</p>}
+        </section>
+        <div className="rank-overview"><RankedCard player={player} /><RPChart player={player} /></div>
         <Tabs value={tab} onValueChange={setTab} className="analysis-tabs">
           <div className="tabs-row">
             <TabsList variant="line" className="main-tabs">
@@ -472,82 +547,14 @@ export default function Home() {
               {player.source === "demo" ? "예시 경기 분석" : "조회된 경기 분석"}
             </span>
           </div>
-          <section className="metrics" aria-label="전적 요약">
-            <article className="metric">
-              <div className="metric-label">
-                평균 순위
-                <Trophy size={17} />
-              </div>
-              <div className="metric-value">
-                <span className="value-prefix">#</span>
-                {formatNumber(stats.averageRank, 1)}
-                <Sparkline
-                  values={filtered.map((m) =>
-                    m.rank === null ? null : -m.rank,
-                  )}
-                />
-              </div>
-              <p>
-                {stats.rankChange === null
-                  ? "최근 조회 경기의 최종 순위"
-                  : stats.rankChange === 0
-                    ? "이전 경기와 평균 순위 동일"
-                    : `이전 ${Math.floor(stats.count / 2)}경기보다 ${Math.abs(stats.rankChange).toFixed(1)}위 ${stats.rankChange > 0 ? "상승" : "하락"}`}
-              </p>
-            </article>
-            <article className="metric">
-              <div className="metric-label">
-                승률
-                <Target size={17} />
-              </div>
-              <div className="metric-value">
-                {formatNumber(stats.winRate, 1)}
-                <span className="value-unit">%</span>
-                <div className="win-bar">
-                  <span style={{ width: `${stats.winRate ?? 0}%` }} />
-                </div>
-              </div>
-              <p>
-                <span className="lime-text">{stats.wins}승</span> /{" "}
-                {stats.count}경기 · 최종 1위 기준
-              </p>
-            </article>
-            <article className="metric">
-              <div className="metric-label">
-                평균 처치
-                <Swords size={17} />
-              </div>
-              <div className="metric-value">
-                {formatNumber(stats.averageKills, 1)}
-                <Sparkline
-                  values={filtered.map((m) => m.kills)}
-                  color="var(--cyan)"
-                />
-              </div>
-              <p>평균 어시스트 {formatNumber(stats.averageAssists, 1)}</p>
-            </article>
-            <article className="metric">
-              <div className="metric-label">
-                평균 피해량
-                <Crosshair size={17} />
-              </div>
-              <div className="metric-value">
-                {formatNumber(stats.averageDamage)}
-                <Sparkline
-                  values={filtered.map((m) => m.damage)}
-                  color="var(--purple)"
-                />
-              </div>
-              <p>플레이어에게 가한 피해량</p>
-            </article>
-          </section>
+          <DetailedMetrics matches={filtered} />
           <div className="content-grid">
             <div className="primary-column">
               <TabsContent value="overview">
                 <section className="match-section">
                   <div className="section-heading">
                     <h3>
-                      최근 경기 <span>{stats.count}</span>
+                      시즌 경기 <span>{stats.count}</span>
                     </h3>
                     <span>
                       <Clock3 size={13} />
@@ -593,37 +600,9 @@ export default function Home() {
                     </div>
                   )}
                 </section>
-                <section className="rank-history">
-                  <div className="section-heading">
-                    <h3>순위 흐름</h3>
-                    <span>최근 최대 20경기 · 오래된 순</span>
-                  </div>
-                  <div className="rank-bars" aria-label="경기별 최종 순위">
-                    {filtered
-                      .slice(0, 20)
-                      .reverse()
-                      .map((m, i) => (
-                        <div
-                          key={m.id}
-                          title={`${m.characterName} · ${m.rank ?? "미제공"}위`}
-                        >
-                          <span
-                            className={m.rank === 1 ? "win" : ""}
-                            style={{
-                              height: `${m.rank === null ? 4 : Math.max(12, 100 - (m.rank - 1) * 10)}%`,
-                            }}
-                          >
-                            {m.rank === null ? "—" : m.rank}
-                          </span>
-                          <small>{i + 1}</small>
-                        </div>
-                      ))}
-                  </div>
-                  <p>막대가 높을수록 높은 순위로 마무리한 경기입니다.</p>
-                </section>
               </TabsContent>
               <TabsContent value="review" id="review">
-                <ReviewContent review={review} count={stats.count} />
+                <ReviewContent review={review} count={Math.min(stats.count, 100)} />
               </TabsContent>
             </div>
             <aside className="secondary-column">
@@ -664,7 +643,7 @@ export default function Home() {
                 <button
                   className="review-button"
                   onClick={() => void generateReview()}
-                  disabled={reviewing || loading || !filtered.length}
+                  disabled={reviewing || loading || historyLoading || !filtered.length}
                 >
                   {reviewing ? (
                     <>
@@ -674,13 +653,21 @@ export default function Home() {
                   ) : (
                     <>
                       <Sparkles size={17} />
-                      {isAI ? "AI 리뷰 만들기" : "분석 리뷰 만들기"}
+                      {isCodex ? player.source === "demo" ? "예시 전적으로 Codex 테스트" : "Codex 리뷰 만들기"
+                        : isAI ? "AI 리뷰 만들기" : "분석 리뷰 만들기"}
                       <ArrowRight size={17} />
                     </>
                   )}
                 </button>
                 <p className="review-footnote">
-                  {isAI
+                  선택한 범위의 최근 {Math.min(filtered.length, 100)}경기를 분석합니다.{" "}
+                  {isCodex
+                    ? "이 PC의 Codex 계정으로 분석합니다. Codex 사용 한도가 적용됩니다."
+                    : config?.aiProvider === "codex" && !config.aiConfigured
+                    ? config.codexStatus === "login-required"
+                      ? "Codex 로그인이 필요합니다. 연결 전에는 기본 분석을 제공합니다."
+                      : "Codex에 연결할 수 없습니다. 연결 전에는 기본 분석을 제공합니다."
+                    : isAI
                     ? "선택한 전적 지표를 AI에 전달해 분석합니다."
                     : "계산된 지표를 바탕으로 기본 분석을 제공합니다."}
                 </p>
@@ -732,6 +719,7 @@ export default function Home() {
               </div>
             </aside>
           </div>
+          {tab === "overview" && <CharacterTable matches={filtered} onSelect={updateCharacter} />}
         </Tabs>
       </main>
       <footer>

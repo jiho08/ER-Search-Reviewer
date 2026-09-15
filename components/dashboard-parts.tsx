@@ -2,6 +2,9 @@
 import { ChevronDown, Info, Check, ArrowUpRight, Sparkles } from "lucide-react";
 import { formatDuration, formatNumber, modeLabel } from "@/lib/analysis";
 import type { Match, ReviewResult } from "@/lib/types";
+import { GameImage } from "@/components/game-image";
+import { gameAsset } from "@/lib/game-assets";
+import { matchOutcome, signedNumber } from "@/lib/player-metrics";
 
 export function Sparkline({
   values,
@@ -36,15 +39,7 @@ export function Sparkline({
   );
 }
 export function CharacterBadge({ code, name }: { code: number; name: string }) {
-  return (
-    <span
-      className={`character-badge character-${code % 3}`}
-      aria-hidden="true"
-    >
-      {name.slice(0, 1)}
-      <span className="badge-cross">+</span>
-    </span>
-  );
+  return <GameImage kind="characters" code={code} label={name} className="character-badge" />;
 }
 export function MatchRow({
   match,
@@ -55,37 +50,39 @@ export function MatchRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const outcome = matchOutcome(match);
+  const outcomeLabel = outcome === "victory" ? "승리" : outcome === "escape-success" ? "탈출 성공" : outcome === "escape-failure" ? "탈출 실패" : "최종 순위";
   return (
-    <div className={`match-card ${match.rank === 1 ? "victory" : ""}`}>
+    <div className={`match-card ${outcome}`}>
       <button
-        className="match-row"
+        className="match-row rich-match-row"
         onClick={onToggle}
         aria-expanded={expanded}
         aria-controls={`detail-${match.id}`}
       >
         <div className="placement">
           <strong>{match.rank === null ? "—" : `#${match.rank}`}</strong>
-          <span>{match.rank === 1 ? "승리" : "최종 순위"}</span>
+          <span>{outcomeLabel}</span>
         </div>
-        <CharacterBadge code={match.characterCode} name={match.characterName} />
+        <div className="match-identity"><CharacterBadge code={match.characterCode} name={match.characterName} />
         <div className="match-character">
           <strong>{match.characterName}</strong>
           <span>
-            {modeLabel(match.mode)} ·{" "}
-            {match.teamMode === 3 ? "스쿼드" : `팀 모드 ${match.teamMode}`}
+            {modeLabel(match.mode)} · Lv.{match.details?.level ?? "—"}
           </span>
-        </div>
+        </div></div>
         <div className="match-kda">
           <strong>
-            {formatNumber(match.kills)} <i>/</i> {formatNumber(match.deaths)}{" "}
+            {formatNumber(match.details?.teamKills ?? null)} <i>/</i> {formatNumber(match.kills)}{" "}
             <i>/</i> {formatNumber(match.assists)}
           </strong>
-          <span>K / D / A</span>
+          <span>TK / K / A</span>
         </div>
         <div className="match-damage">
           <strong>{formatNumber(match.damage)}</strong>
-          <span>플레이어 피해량</span>
+          <span>딜량</span>
         </div>
+        <div className="match-score"><strong className={match.mode === 3 && match.mmrGain !== null && match.mmrGain < 0 ? "negative" : "positive"}>{match.mode === 3 ? signedNumber(match.mmrGain) : "—"} <small>RP</small></strong><span>{match.mode === 3 ? `${formatNumber(match.details?.rpAfter ?? null)} RP` : "일반 경기"}</span></div>
         <div className="match-time">
           <strong>{formatDuration(match.duration)}</strong>
           <span>
@@ -100,6 +97,10 @@ export function MatchRow({
         </div>
         <ChevronDown size={17} className={expanded ? "rotate" : ""} />
       </button>
+      <div className="match-loadout">
+        <div className="match-traits"><div><GameImage kind="traits" code={match.details?.mainTrait ?? null} /><span>{gameAsset("traits", match.details?.mainTrait ?? null)?.name ?? "특성 미제공"}</span></div><div><GameImage kind="tactical" code={match.details?.tacticalSkill ?? null} /><span>{gameAsset("tactical", match.details?.tacticalSkill ?? null)?.name ?? "전술 스킬"}<small>{match.details?.tacticalLevel ? ` Lv.${match.details.tacticalLevel}` : ""}</small></span></div></div>
+        <div className="match-equipment" aria-label="최종 장비">{["무기", "옷", "머리", "팔", "다리"].map((label, slot) => <GameImage key={slot} kind="items" code={match.details?.equipment.find((item) => item.slot === slot)?.code ?? null} label={`${label} 미제공`} />)}</div>
+      </div>
       {expanded && (
         <div className="match-detail" id={`detail-${match.id}`}>
           <div>
@@ -119,12 +120,36 @@ export function MatchRow({
             <strong>{formatNumber(match.hunting)}</strong>
           </div>
           <div>
+            <span>동물에게 가한 피해량</span>
+            <strong>{formatNumber(match.details?.animalDamage ?? null)}</strong>
+          </div>
+          <div>
             <span>RP 변화</span>
             <strong>
               {match.mmrGain === null
                 ? "미제공"
                 : `${match.mmrGain > 0 ? "+" : ""}${match.mmrGain}`}
             </strong>
+          </div>
+          <div>
+            <span>팀 전체 처치 / 사망</span>
+            <strong>{formatNumber(match.details?.teamKills ?? null)} / {formatNumber(match.deaths)}</strong>
+          </div>
+          <div>
+            <span>획득 크레딧</span>
+            <strong>{formatNumber(match.details?.credits ?? null)}</strong>
+          </div>
+          <div>
+            <span>시야 기여 점수</span>
+            <strong>{formatNumber(match.details?.vision ?? null)}</strong>
+          </div>
+          <div className="subtrait-detail">
+            <span>보조 특성</span>
+            <div>{match.details?.subTraits.length ? match.details.subTraits.map((code, index) => <div key={`${code}-${index}`}><GameImage kind="traits" code={code} /><strong>{gameAsset("traits", code)?.name ?? `특성 ${code}`}</strong></div>) : <strong>미제공</strong>}</div>
+          </div>
+          <div className="equipment-detail">
+            <span>최종 장비</span>
+            <strong>{match.details?.equipment.length ? match.details.equipment.map((item) => gameAsset("items", item.code)?.name ?? `아이템 ${item.code}`).join(" · ") : "미제공"}</strong>
           </div>
           <div>
             <span>경기 ID</span>
@@ -168,7 +193,7 @@ export function ReviewContent({
       <div className="review-result-heading">
         <span className="eyebrow">YOUR PLAY, IN FOCUS</span>
         <span className="outline-tag">
-          {review.engine === "openai" ? "AI 리뷰" : "기본 분석"}
+          {review.engine === "codex" ? "Codex 리뷰" : review.engine === "openai" ? "AI 리뷰" : "기본 분석"}
           {review.source === "demo" ? " · 예시" : ""}
         </span>
       </div>

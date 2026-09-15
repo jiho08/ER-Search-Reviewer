@@ -106,10 +106,40 @@ test("official localization parses U+2503 separator", () => {
     { 2: "아야", 6: "나딘" },
   );
 });
+
+test("nickname lookup accepts the live userId field and uses UID-based game routes", async () => {
+  const calls = [];
+  const api = createErClient("fixture-key", async (url) => {
+    calls.push(String(url));
+    if (url.includes("/nickname")) return response({
+      code: 200, message: "Success", user: { nickname: "테스트", userId: "player/id+live" },
+    });
+    if (url.includes("/user/games/uid/player%2Fid%2Blive")) return response({
+      code: 200, userGames: [{ gameId: 123, characterNum: 2 }],
+    });
+    return response({ code: 200, data: {} });
+  });
+  const player = await api.getPlayer("테스트");
+  assert.equal(player.uid, "player/id+live");
+  assert.equal(player.nickname, "테스트");
+  assert.equal(player.matches.length, 1);
+  assert.ok(calls.some((url) => url.endsWith("/v1/user/games/uid/player%2Fid%2Blive")));
+});
+
+test("malformed player identifiers are upstream errors, not nonexistent nicknames", async () => {
+  for (const user of [{ nickname: "테스트", userNum: 123 }, { nickname: "테스트", userId: "  ", uid: 123 }]) {
+    const api = createErClient("fixture-key", async () => response({ code: 200, user }));
+    await assert.rejects(() => api.getPlayer("테스트"), { status: 502 });
+  }
+  const missing = createErClient("fixture-key", async () => response({ code: 404 }));
+  await assert.rejects(() => missing.getPlayer("없는닉네임"), { status: 404 });
+});
 test("live lookup uses string UID, encodes nickname, deduplicates and caches", async () => {
   const calls = [];
-  const api = createErClient("test-key", async (url, init) => {
+  const requestTimes = [];
+  const api = createErClient(" test-key ", async (url, init) => {
     calls.push(url);
+    requestTimes.push(Date.now());
     assert.equal(init.headers["x-api-key"], "test-key");
     if (url.includes("/nickname"))
       return response({
@@ -133,13 +163,19 @@ test("live lookup uses string UID, encodes nickname, deduplicates and caches", a
   assert.ok(calls[0].includes(encodeURIComponent("이름 & 문자")));
   assert.equal(player.uid, "uid-alpha");
   assert.equal(player.source, "live");
-  assert.equal(player.matches.length, 100);
+  assert.equal(player.matches.length, 101);
   assert.equal(player.matches[0].id, "101");
   const count = calls.length;
   await api.getPlayer("이름 & 문자");
   assert.equal(calls.length, count);
   await api.getPlayer("이름 & 문자", true);
   assert.ok(calls.length > count);
+  for (let i = 1; i < requestTimes.length; i++) {
+    assert.ok(
+      requestTimes[i] - requestTimes[i - 1] >= 1_000,
+      "personal keys must not receive more than one request per second",
+    );
+  }
 });
 test("missing key and upstream throttling produce explicit failures, never demo records", async () => {
   const noKey = createErClient("", async () => {

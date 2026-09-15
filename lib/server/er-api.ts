@@ -1,5 +1,7 @@
 import { AppError } from "./errors.ts";
-import type { Match, PlayerData } from "../types";
+import type { HistoryPage, Match, PlayerData, RankedProfile, Season } from "../types";
+import { isBeforeSeason, mergeMatches } from "../season-history.ts";
+import catalog from "../generated/game-assets.json" with { type: "json" };
 
 type Raw = Record<string, unknown>;
 const isObject = (v: unknown): v is Raw =>
@@ -27,7 +29,7 @@ export function normalizeMatch(
   return {
     id: String(raw.gameId),
     characterCode: code,
-    characterName: names[code] || `실험체 ${code}`,
+    characterName: names[code] || (catalog.characters as Record<string, { name: string }>)[code]?.name || `실험체 ${code}`,
     mode: number(raw.matchingMode) ?? 0,
     teamMode: number(raw.matchingTeamMode) ?? 0,
     seasonId: number(raw.seasonId),
@@ -41,6 +43,24 @@ export function normalizeMatch(
     hunting: number(raw.monsterKill),
     duration: number(raw.playTime),
     mmrGain: number(raw.mmrGain, -Infinity),
+    details: {
+      level: number(raw.characterLevel),
+      teamKills: number(raw.teamKill),
+      credits: number(raw.totalGainVFCredit),
+      vision: number(raw.viewContribution),
+      animalDamage: number(raw.damageToMonster),
+      escapeState: number(raw.escapeState),
+      rpBefore: number(raw.mmrBefore),
+      rpAfter: number(raw.mmrAfter),
+      equipment: isObject(raw.equipment)
+        ? Object.entries(raw.equipment).filter(([slot, code]) => /^[0-4]$/.test(slot) && Number.isSafeInteger(code) && Number(code) > 0)
+          .map(([slot, code]) => ({ slot: Number(slot), code: Number(code) })).sort((a, b) => a.slot - b.slot)
+        : [],
+      mainTrait: number(raw.traitFirstCore, 1),
+      subTraits: [raw.traitFirstSub, raw.traitSecondSub].flatMap((list) => Array.isArray(list) ? list.filter((id): id is number => Number.isSafeInteger(id) && Number(id) > 0) : []).slice(0, 5),
+      tacticalSkill: number(raw.tacticalSkillGroup, 1),
+      tacticalLevel: number(raw.tacticalSkillLevel),
+    },
   };
 }
 
@@ -53,9 +73,65 @@ export function parseLocalization(text: string): Record<number, string> {
   return result;
 }
 
+export function currentSeason(data: unknown): { id: number; name: string } | null {
+  if (!Array.isArray(data)) return null;
+  const candidates = data.filter((row) => isObject(row) && (row.isCurrent === 1 || row.isCurrent === true) && Number.isSafeInteger(row.seasonID) && Number(row.seasonID) > 0);
+  if (candidates.length !== 1) return null;
+  const id = candidates[0].seasonID as number;
+  const name = (catalog.seasons as Record<string, string>)[id] || `현재 시즌 (ID ${id})`;
+  return { id, name };
+}
+
+export function normalizeSeasons(data: unknown): Season[] {
+  if (!Array.isArray(data)) return [];
+  const date = (value: unknown) => {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}[ T]/.test(value)) return null;
+    const day = value.slice(0, 10);
+    const time = Date.parse(`${day}T00:00:00Z`);
+    return Number.isFinite(time) && new Date(time).toISOString().startsWith(day) ? day : null;
+  };
+  const current = currentSeason(data);
+  const seasons = new Map<number, Season>();
+  for (const raw of data) {
+    if (!isObject(raw) || !Number.isSafeInteger(raw.seasonID) || Number(raw.seasonID) <= 0) continue;
+    const id = Number(raw.seasonID);
+    seasons.set(id, {
+      id, name: (catalog.seasons as Record<string, string>)[id] || `시즌 ID ${id}`,
+      isCurrent: id === current?.id,
+      // Season tables supply calendar dates with no timezone. Do not parse their times as UTC.
+      startDate: date(raw.seasonStart), endDate: date(raw.seasonEnd),
+    });
+  }
+  return [...seasons.values()].sort((a, b) => b.id - a.id);
+}
+
+export function normalizeRankedProfile(season: { id: number; name: string }, rankData: Raw, statsData: Raw): RankedProfile {
+  const rank = isObject(rankData.userRank) ? rankData.userRank : {};
+  const stats = Array.isArray(statsData.userStats) ? statsData.userStats.find((s) => isObject(s) && s.seasonId === season.id && s.matchingMode === 3 && s.matchingTeamMode === 3) ?? {} : {};
+  const totalGames = number(stats.totalGames);
+  const teamKills = number(stats.totalTeamKills);
+  const percent = number(stats.rankPercent);
+  return {
+    seasonId: season.id, seasonName: season.name,
+    rp: number(rank.mmr) ?? number(stats.mmr),
+    rank: number(rank.rank, 1) ?? number(stats.rank, 1),
+    serverRank: number(rank.serverRank, 1), serverCode: number(rank.serverCode),
+    rankPercent: percent !== null && percent <= 1 ? percent * 100 : null,
+    totalGames, totalWins: number(stats.totalWins), averageRank: number(stats.averageRank, 1),
+    averageTeamKills: totalGames && teamKills !== null ? teamKills / totalGames : null,
+  };
+}
+
 export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
   const cache = new Map<string, { until: number; value: PlayerData }>();
+  type HistoryEntry = {
+    player: PlayerData; names: Record<number, string>; until: number;
+    batches: HistoryPage[];
+    pending?: Promise<HistoryPage>; last?: { cursor: string; page: HistoryPage };
+  };
+  const histories = new Map<string, HistoryEntry>();
   let nameCache: { until: number; value: Record<number, string> } | null = null;
+  let seasonCache: { until: number; value: Season[] } | null = null;
   let lastRequest = 0;
   let chain = Promise.resolve();
   async function request(path: string): Promise<Raw> {
@@ -64,7 +140,8 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
         "실제 전적 검색을 사용하려면 서버의 ER_API_KEY 설정이 필요합니다. 현재는 예시 모드를 이용할 수 있어요.",
         503,
       );
-    // Serialize official API calls within this server instance. No assumed upstream quota.
+    // Personal keys allow one request per second. Leave a small timing margin.
+    // https://developer.eternalreturn.io/getting-started
     const previous = chain;
     let release!: () => void;
     chain = new Promise<void>((resolve) => {
@@ -72,11 +149,11 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
     });
     await previous;
     try {
-      const wait = Math.max(0, 350 - (Date.now() - lastRequest));
+      const wait = Math.max(0, 1_100 - (Date.now() - lastRequest));
       if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
       lastRequest = Date.now();
       const response = await fetcher(`https://open-api.bser.io${path}`, {
-        headers: { "x-api-key": apiKey, Accept: "application/json" },
+        headers: { "x-api-key": apiKey.trim(), Accept: "application/json" },
         signal: AbortSignal.timeout(12_000),
       });
       if (response.status === 429)
@@ -147,7 +224,7 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
         return {};
       const response = await fetcher(url.href, {
         signal: AbortSignal.timeout(8_000),
-        redirect: "error",
+        redirect: "manual",
       });
       if (!response.ok) return {};
       const text = await response.text();
@@ -162,41 +239,71 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
   async function getPlayer(
     nickname: string,
     refresh = false,
+    seasonId?: number,
   ): Promise<PlayerData> {
-    const cached = cache.get(nickname);
-    if (!refresh && cached && cached.until > Date.now()) return cached.value;
+    const cacheKey = JSON.stringify([nickname, seasonId ?? "current"]);
+    const cached = cache.get(cacheKey);
+    if (!refresh && cached && cached.until > Date.now())
+      return histories.get(cached.value.history?.id ?? "")?.player ?? cached.value;
     const lookup = await request(
       `/v1/user/nickname?query=${encodeURIComponent(nickname)}`,
     );
-    if (
-      !isObject(lookup.user) ||
-      typeof lookup.user.uid !== "string" ||
-      !lookup.user.uid
-    )
+    if (!isObject(lookup.user))
       throw new AppError(
         "플레이어를 찾지 못했습니다. 현재 닉네임을 확인해 주세요.",
         404,
       );
-    const uid = lookup.user.uid;
+    // Live responses use userId; the official response example still calls it uid.
+    // Both are opaque strings used by the same /uid/ endpoints (never userNum).
+    const uid = [lookup.user.userId, lookup.user.uid].find(
+      (value): value is string => typeof value === "string" && value.trim().length > 0,
+    );
+    if (!uid)
+      throw new AppError(
+        "플레이어 조회 응답의 식별자를 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.",
+        502,
+      );
     const response = await request(
       `/v1/user/games/uid/${encodeURIComponent(uid)}`,
     );
     if (!Array.isArray(response.userGames))
       throw new AppError("경기 목록 응답 형식을 확인할 수 없습니다.", 502);
     const names = await characterNames();
-    const unique = new Map<string, Match>();
+    const records: Match[] = [];
     for (const raw of response.userGames) {
       if (!isObject(raw)) continue;
       const match = normalizeMatch(raw, names);
-      if (match) unique.set(match.id, match);
+      if (match) records.push(match);
     }
-    const matches = [...unique.values()]
-      .sort((a, b) => {
-        if (a.startedAt && b.startedAt)
-          return Date.parse(b.startedAt) - Date.parse(a.startedAt);
-        return Number(b.id) - Number(a.id);
-      })
-      .slice(0, 100);
+    let seasons: Season[] = [];
+    let season: Season | null = null;
+    let ranked: RankedProfile | null = null;
+    let rankedNotice = "";
+    try {
+      if (!seasonCache || seasonCache.until <= Date.now()) {
+        const data = await request("/v2/data/Season");
+        const list = normalizeSeasons(data.data);
+        seasonCache = { until: Date.now() + (list.length ? 3_600_000 : 60_000), value: list };
+      }
+      seasons = seasonCache.value;
+      season = (seasonId === undefined ? seasons.find((s) => s.isCurrent) : seasons.find((s) => s.id === seasonId)) ?? null;
+      if (season) {
+        const results = await Promise.allSettled([
+          request(`/v1/rank/uid/${encodeURIComponent(uid)}/${season.id}/3`),
+          request(`/v2/user/stats/uid/${encodeURIComponent(uid)}/${season.id}/3`),
+        ]);
+        ranked = normalizeRankedProfile(season,
+          results[0].status === "fulfilled" ? results[0].value : {},
+          results[1].status === "fulfilled" ? results[1].value : {});
+        if (results.some((r) => r.status === "rejected")) rankedNotice = "시즌 성적 일부를 불러오지 못했습니다. 전적 새로고침으로 다시 확인할 수 있어요.";
+      } else rankedNotice = "현재 시즌 정보를 확인할 수 없어 티어·시즌 성적을 표시하지 않았습니다.";
+    } catch {
+      rankedNotice = "시즌 성적을 불러오지 못했습니다. 최근 경기는 아래에서 확인할 수 있어요.";
+    }
+    if (seasonId !== undefined && !season)
+      throw new AppError("선택한 시즌 정보를 확인할 수 없습니다. 전적을 새로고침해 주세요.", 422);
+    const matches = mergeMatches([], records.filter((match) => !season || match.seasonId === season.id));
+    const next = isBeforeSeason(records, season, seasons) ? null : nextCursor(response.next);
     const value: PlayerData = {
       source: "live",
       nickname:
@@ -206,11 +313,74 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
       uid,
       fetchedAt: new Date().toISOString(),
       matches,
+      ranked,
+      rankedNotice,
+      seasons, season,
+      history: { id: crypto.randomUUID(), next, pages: 1, exhausted: next === null },
       notice: "최근 90일 · 현재 닉네임 사용 기간 내 제공된 경기만 표시됩니다.",
     };
     if (cache.size >= 100) cache.delete(cache.keys().next().value!);
-    cache.set(nickname, { until: Date.now() + 60_000, value });
+    cache.set(cacheKey, { until: Date.now() + 60_000, value });
+    for (const [id, entry] of histories) if (entry.until <= Date.now()) histories.delete(id);
+    if (histories.size >= 20) histories.delete(histories.keys().next().value!);
+    histories.set(value.history!.id, { player: value, names, until: Date.now() + 1_800_000,
+      batches: [{ matches, history: value.history! }],
+    });
     return value;
   }
-  return { getPlayer };
+  function nextCursor(value: unknown): string | null {
+    if (value === undefined || value === null || value === 0 || value === "0") return null;
+    if ((typeof value === "number" && Number.isSafeInteger(value) && value > 0) ||
+      (typeof value === "string" && /^[1-9]\d{0,19}$/.test(value))) return String(value);
+    throw new AppError("다음 경기 위치를 확인할 수 없습니다. 전적을 새로고침해 주세요.", 502);
+  }
+  function historyEntry(id: string): HistoryEntry {
+    const entry = histories.get(id);
+    if (!entry || entry.until <= Date.now()) {
+      histories.delete(id);
+      throw new AppError("전적 조회가 만료되었습니다. 전적을 새로고침해 주세요.", 409);
+    }
+    entry.until = Date.now() + 1_800_000;
+    return entry;
+  }
+  function getHistoryPlayer(id: string, nickname: string, seasonId?: number, pages?: number): PlayerData {
+    const entry = historyEntry(id);
+    const { player } = entry;
+    if (player.nickname !== nickname || (seasonId !== undefined && player.season?.id !== seasonId))
+      throw new AppError("조회한 플레이어와 시즌을 다시 확인해 주세요.", 409);
+    if (pages !== undefined) {
+      if (!Number.isInteger(pages) || pages < 1 || pages > entry.batches.length)
+        throw new AppError("화면의 전적 범위를 확인할 수 없습니다. 전적을 새로고침해 주세요.", 409);
+      // A paused browser may not receive an in-flight page. Review exactly its acknowledged pages.
+      return { ...player, matches: mergeMatches([], entry.batches.slice(0, pages).flatMap((batch) => batch.matches)), history: entry.batches[pages - 1].history };
+    }
+    return player;
+  }
+  async function continueHistory(id: string, cursor: string): Promise<HistoryPage> {
+    const entry = historyEntry(id);
+    if (entry.last?.cursor === cursor) return entry.last.page;
+    if (entry.player.history?.next !== cursor)
+      throw new AppError("경기 조회 위치가 변경되었습니다. 전적을 새로고침해 주세요.", 409);
+    if (entry.pending) return entry.pending;
+    entry.pending = (async () => {
+      const player = entry.player;
+      const response = await request(`/v1/user/games/uid/${encodeURIComponent(player.uid)}?next=${encodeURIComponent(cursor)}`);
+      if (!Array.isArray(response.userGames)) throw new AppError("경기 목록 응답 형식을 확인할 수 없습니다.", 502);
+      const records = response.userGames.flatMap((raw) => {
+        const match = isObject(raw) ? normalizeMatch(raw, entry.names) : null;
+        return match ? [match] : [];
+      });
+      const next = isBeforeSeason(records, player.season ?? null, player.seasons ?? []) ? null : nextCursor(response.next);
+      if (next !== null && BigInt(next) >= BigInt(cursor))
+        throw new AppError("전적 서버가 같은 경기 목록을 반복해서 반환했습니다. 잠시 후 이어서 불러와 주세요.", 502);
+      const matches = mergeMatches([], records.filter((match) => !player.season || match.seasonId === player.season.id));
+      const page: HistoryPage = { matches, history: { id, next, pages: player.history!.pages + 1, exhausted: next === null } };
+      entry.player = { ...player, matches: mergeMatches(player.matches, matches), history: page.history };
+      entry.batches.push(page);
+      entry.last = { cursor, page };
+      return page;
+    })();
+    try { return await entry.pending; } finally { entry.pending = undefined; }
+  }
+  return { getPlayer, continueHistory, getHistoryPlayer };
 }

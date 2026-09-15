@@ -36,6 +36,9 @@ export async function POST(request: Request) {
       { error: "닉네임·모드·리뷰 주제를 확인해 주세요." },
       { status: 400 },
     );
+  if (process.env.AI_PROVIDER === "codex" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(new URL(request.url).hostname))
+    return Response.json({ error: "Codex 리뷰는 이 PC에서만 사용할 수 있습니다." }, { status: 403 });
   if (Date.now() - windowStart > 60_000) {
     windowStart = Date.now();
     requests = 0;
@@ -52,6 +55,9 @@ export async function POST(request: Request) {
       getPlayer,
       apiKey: process.env.OPENAI_API_KEY,
       model: process.env.OPENAI_MODEL,
+      provider: process.env.AI_PROVIDER === "codex" ? "codex"
+        : process.env.AI_PROVIDER === "rules" ? "rules" : "openai",
+      codex: { url: process.env.CODEX_BRIDGE_URL, token: process.env.CODEX_BRIDGE_TOKEN },
     });
     return Response.json(review, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
