@@ -2,6 +2,9 @@ import { AppError } from "./errors.ts";
 import type { HistoryPage, Match, PlayerData, RankedProfile, Season } from "../types";
 import { isBeforeSeason, mergeMatches } from "../season-history.ts";
 import catalog from "../generated/game-assets.json" with { type: "json" };
+import { memoryStore } from "./state-store.ts";
+import type { StateStore } from "./state-store.ts";
+import { createRequestGate } from "./request-gate.ts";
 
 type Raw = Record<string, unknown>;
 const isObject = (v: unknown): v is Raw =>
@@ -122,18 +125,34 @@ export function normalizeRankedProfile(season: { id: number; name: string }, ran
   };
 }
 
-export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
-  const cache = new Map<string, { until: number; value: PlayerData }>();
+export function createErClient(apiKey: string, fetcher: typeof fetch = fetch, options: {
+  store?: StateStore; maxHistories?: number; refreshCooldown?: boolean;
+  gate?: ReturnType<typeof createRequestGate>;
+} = {}) {
+  const store = options.store ?? memoryStore();
   type HistoryEntry = {
     player: PlayerData; names: Record<number, string>; until: number;
-    batches: HistoryPage[];
-    pending?: Promise<HistoryPage>; last?: { cursor: string; page: HistoryPage };
+    last?: { cursor: string; page: number };
   };
-  const histories = new Map<string, HistoryEntry>();
-  let nameCache: { until: number; value: Record<number, string> } | null = null;
-  let seasonCache: { until: number; value: Season[] } | null = null;
-  let lastRequest = 0;
-  let chain = Promise.resolve();
+  type Cached<T> = { until: number; value: T };
+  const pendingPages = new Map<string, Promise<HistoryPage>>();
+  const pendingPlayers = new Map<string, Promise<PlayerData>>();
+  const gate = options.gate ?? createRequestGate(store);
+  const historyKey = (id: string) => `history:${id}`;
+  const pageKey = (id: string, page: number) => `page:${id}:${page}`;
+  function removeHistory(id: string) {
+    store.delete(historyKey(id));
+    for (const key of store.keys(`page:${id}:`)) store.delete(key);
+  }
+  function prune() {
+    for (const key of [...store.keys("history:"), ...store.keys("cache:"), ...store.keys("meta:")]) {
+      const entry = store.get<{ until: number }>(key);
+      if (entry && entry.until <= Date.now()) {
+        if (key.startsWith("history:")) removeHistory(key.slice(8));
+        else store.delete(key);
+      }
+    }
+  }
   async function request(path: string): Promise<Raw> {
     if (!apiKey.trim())
       throw new AppError(
@@ -142,20 +161,11 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
       );
     // Personal keys allow one request per second. Leave a small timing margin.
     // https://developer.eternalreturn.io/getting-started
-    const previous = chain;
-    let release!: () => void;
-    chain = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
     try {
-      const wait = Math.max(0, 1_100 - (Date.now() - lastRequest));
-      if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
-      lastRequest = Date.now();
-      const response = await fetcher(`https://open-api.bser.io${path}`, {
+      const response = await gate(() => fetcher(`https://open-api.bser.io${path}`, {
         headers: { "x-api-key": apiKey.trim(), Accept: "application/json" },
         signal: AbortSignal.timeout(12_000),
-      });
+      }));
       if (response.status === 429)
         throw new AppError(
           "전적 API 요청 한도에 도달했습니다. 잠시 후 다시 검색해 주세요.",
@@ -198,11 +208,10 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
         "전적 서버 연결 시간이 초과되었거나 연결에 실패했습니다.",
         502,
       );
-    } finally {
-      release();
     }
   }
   async function characterNames(): Promise<Record<number, string>> {
+    const nameCache = store.get<Cached<Record<number, string>>>("meta:names");
     if (nameCache && nameCache.until > Date.now()) return nameCache.value;
     try {
       const metadata = await request("/v1/l10n/Korean");
@@ -230,7 +239,7 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
       const text = await response.text();
       if (text.length > 12_000_000) return {};
       const names = parseLocalization(text);
-      nameCache = { until: Date.now() + 86_400_000, value: names };
+      store.set("meta:names", { until: Date.now() + 86_400_000, value: names });
       return names;
     } catch {
       return {};
@@ -241,10 +250,20 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
     refresh = false,
     seasonId?: number,
   ): Promise<PlayerData> {
-    const cacheKey = JSON.stringify([nickname, seasonId ?? "current"]);
-    const cached = cache.get(cacheKey);
-    if (!refresh && cached && cached.until > Date.now())
-      return histories.get(cached.value.history?.id ?? "")?.player ?? cached.value;
+    const key = JSON.stringify([nickname, seasonId ?? "current"]);
+    const active = pendingPlayers.get(key);
+    if (active) return active;
+    const job = loadPlayer(nickname, refresh, seasonId);
+    pendingPlayers.set(key, job);
+    try { return await job; } finally { pendingPlayers.delete(key); }
+  }
+  async function loadPlayer(nickname: string, refresh: boolean, seasonId?: number): Promise<PlayerData> {
+    const cacheKey = `cache:${JSON.stringify([nickname, seasonId ?? "current"])}`;
+    const cached = store.get<Cached<string>>(cacheKey);
+    if ((!refresh || options.refreshCooldown) && cached && cached.until > Date.now()) {
+      const entry = store.get<HistoryEntry>(historyKey(cached.value));
+      if (entry && entry.until > Date.now()) return getHistoryPlayer(cached.value, entry.player.nickname, seasonId);
+    }
     const lookup = await request(
       `/v1/user/nickname?query=${encodeURIComponent(nickname)}`,
     );
@@ -280,10 +299,12 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
     let ranked: RankedProfile | null = null;
     let rankedNotice = "";
     try {
+      let seasonCache = store.get<Cached<Season[]>>("meta:seasons");
       if (!seasonCache || seasonCache.until <= Date.now()) {
         const data = await request("/v2/data/Season");
         const list = normalizeSeasons(data.data);
         seasonCache = { until: Date.now() + (list.length ? 3_600_000 : 60_000), value: list };
+        store.set("meta:seasons", seasonCache);
       }
       seasons = seasonCache.value;
       season = (seasonId === undefined ? seasons.find((s) => s.isCurrent) : seasons.find((s) => s.id === seasonId)) ?? null;
@@ -319,12 +340,20 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
       history: { id: crypto.randomUUID(), next, pages: 1, exhausted: next === null },
       notice: "최근 90일 · 현재 닉네임 사용 기간 내 제공된 경기만 표시됩니다.",
     };
-    if (cache.size >= 100) cache.delete(cache.keys().next().value!);
-    cache.set(cacheKey, { until: Date.now() + 60_000, value });
-    for (const [id, entry] of histories) if (entry.until <= Date.now()) histories.delete(id);
-    if (histories.size >= 20) histories.delete(histories.keys().next().value!);
-    histories.set(value.history!.id, { player: value, names, until: Date.now() + 1_800_000,
-      batches: [{ matches, history: value.history! }],
+    store.transaction(() => {
+      prune();
+      const caches = store.keys("cache:");
+      if (caches.length >= (options.maxHistories ?? 100)) store.delete(caches[0]);
+      const histories = store.keys("history:");
+      if (histories.length >= (options.maxHistories ?? 20)) {
+        // Never evict a session while its next page is being fetched.
+        const oldest = histories.find((key) => !pendingPages.has(key.slice(8)));
+        if (!oldest) throw new AppError("전적 조회가 많습니다. 잠시 후 다시 검색해 주세요.", 429);
+        removeHistory(oldest.slice(8));
+      }
+      store.set(cacheKey, { until: Date.now() + 60_000, value: value.history!.id });
+      store.set(historyKey(value.history!.id), { player: { ...value, matches: [] }, names, until: Date.now() + 1_800_000 });
+      store.set(pageKey(value.history!.id, 1), { matches, history: value.history! });
     });
     return value;
   }
@@ -335,12 +364,13 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
     throw new AppError("다음 경기 위치를 확인할 수 없습니다. 전적을 새로고침해 주세요.", 502);
   }
   function historyEntry(id: string): HistoryEntry {
-    const entry = histories.get(id);
+    const entry = store.get<HistoryEntry>(historyKey(id));
     if (!entry || entry.until <= Date.now()) {
-      histories.delete(id);
+      removeHistory(id);
       throw new AppError("전적 조회가 만료되었습니다. 전적을 새로고침해 주세요.", 409);
     }
     entry.until = Date.now() + 1_800_000;
+    store.set(historyKey(id), entry);
     return entry;
   }
   function getHistoryPlayer(id: string, nickname: string, seasonId?: number, pages?: number): PlayerData {
@@ -348,21 +378,29 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
     const { player } = entry;
     if (player.nickname !== nickname || (seasonId !== undefined && player.season?.id !== seasonId))
       throw new AppError("조회한 플레이어와 시즌을 다시 확인해 주세요.", 409);
-    if (pages !== undefined) {
-      if (!Number.isInteger(pages) || pages < 1 || pages > entry.batches.length)
+    const count = pages ?? player.history!.pages;
+    if (!Number.isInteger(count) || count < 1 || count > player.history!.pages)
         throw new AppError("화면의 전적 범위를 확인할 수 없습니다. 전적을 새로고침해 주세요.", 409);
-      // A paused browser may not receive an in-flight page. Review exactly its acknowledged pages.
-      return { ...player, matches: mergeMatches([], entry.batches.slice(0, pages).flatMap((batch) => batch.matches)), history: entry.batches[pages - 1].history };
+    const batches: HistoryPage[] = [];
+    for (let page = 1; page <= count; page++) {
+      const batch = store.get<HistoryPage>(pageKey(id, page));
+      if (!batch) throw new AppError("저장된 전적을 확인할 수 없습니다. 전적을 새로고침해 주세요.", 409);
+      batches.push(batch);
     }
-    return player;
+    // A paused browser may not receive an in-flight page. Review only acknowledged pages.
+    return { ...player, matches: mergeMatches([], batches.flatMap((batch) => batch.matches)), history: batches[count - 1].history };
   }
   async function continueHistory(id: string, cursor: string): Promise<HistoryPage> {
     const entry = historyEntry(id);
-    if (entry.last?.cursor === cursor) return entry.last.page;
+    if (entry.last?.cursor === cursor) {
+      const previous = store.get<HistoryPage>(pageKey(id, entry.last.page));
+      if (previous) return previous;
+    }
     if (entry.player.history?.next !== cursor)
       throw new AppError("경기 조회 위치가 변경되었습니다. 전적을 새로고침해 주세요.", 409);
-    if (entry.pending) return entry.pending;
-    entry.pending = (async () => {
+    const pending = pendingPages.get(id);
+    if (pending) return pending;
+    const job = (async () => {
       const player = entry.player;
       const response = await request(`/v1/user/games/uid/${encodeURIComponent(player.uid)}?next=${encodeURIComponent(cursor)}`);
       if (!Array.isArray(response.userGames)) throw new AppError("경기 목록 응답 형식을 확인할 수 없습니다.", 502);
@@ -375,12 +413,17 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch) {
         throw new AppError("전적 서버가 같은 경기 목록을 반복해서 반환했습니다. 잠시 후 이어서 불러와 주세요.", 502);
       const matches = mergeMatches([], records.filter((match) => !player.season || match.seasonId === player.season.id));
       const page: HistoryPage = { matches, history: { id, next, pages: player.history!.pages + 1, exhausted: next === null } };
-      entry.player = { ...player, matches: mergeMatches(player.matches, matches), history: page.history };
-      entry.batches.push(page);
-      entry.last = { cursor, page };
+      entry.player = { ...player, matches: [], history: page.history };
+      entry.last = { cursor, page: page.history.pages };
+      entry.until = Date.now() + 1_800_000;
+      store.transaction(() => {
+        store.set(pageKey(id, page.history.pages), page);
+        store.set(historyKey(id), entry);
+      });
       return page;
     })();
-    try { return await entry.pending; } finally { entry.pending = undefined; }
+    pendingPages.set(id, job);
+    try { return await job; } finally { pendingPages.delete(id); }
   }
-  return { getPlayer, continueHistory, getHistoryPlayer };
+  return { getPlayer, continueHistory, getHistoryPlayer, prune };
 }

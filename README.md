@@ -2,7 +2,7 @@
 
 `ER-Search-Reviewer` · 2026 Eternal Return 검색 / 평가
 
-문서 갱신일: 2026-09-15. 검증 날짜와 범위는 아래 [검증](#검증)에 정리합니다.
+문서 갱신일: 2026-09-16. 검증 날짜와 범위는 아래 [검증](#검증)에 정리합니다.
 
 닉네임으로 이터널 리턴 전적을 조회하고, 선택한 경기의 지표를 분석해 개인 리뷰를 제공하는 웹 프로젝트입니다.
 
@@ -83,6 +83,26 @@ ER_API_KEY=발급받은_이터널리턴_API키
 
 기존 OpenAI API 방식도 선택할 수 있습니다. 이 경우에만 `AI_PROVIDER=openai`, `OPENAI_API_KEY`, `OPENAI_MODEL`을 설정합니다. 기본 API 모델은 `gpt-4.1-mini`이며 API 요금은 Codex 구독과 별도입니다.
 
+## Cloudflare 공개 배포 준비
+
+공개용 Worker 설정과 공유 저장·요청 제한을 구현했습니다. **실제 Cloudflare 업로드와 공개 주소 발급은 아직 하지 않았습니다.** 계정 연결, 기존 GitHub 저장소 연결, Secret 등록과 실제 배포 절차는 [Cloudflare 배포 안내](docs/cloudflare-deployment.md)에 정리했습니다.
+
+```bash
+npm run build:public     # dist-public에 공개용 빌드
+npm run check:deploy     # 업로드 없이 Wrangler dry-run
+npm run preview:public   # http://127.0.0.1:8788에서 예시 데이터로 확인
+```
+
+공개용 실행은 루트 `.env`와 로컬 Codex 브리지를 읽지 않습니다. 기존 `npm run dev`의 Codex 연결은 유지합니다. 공개 버전은 `AI_PROVIDER=rules`가 기본이며, OpenAI 리뷰를 켜려면 명시적인 `openai` 설정, Cloudflare의 `OPENAI_API_KEY` Secret, 양수인 `AI_DAILY_LIMIT`이 모두 필요합니다. 공개 서버의 `codex` 설정은 거부합니다.
+
+- 전적·페이지·조회 커서를 Durable Object의 SQLite에 저장하여 Worker가 바뀌거나 재시작되어도 이어서 조회합니다. 마지막 조회부터 30분, 최대 200개 세션을 유지하는 임시 저장소입니다.
+- 같은 닉네임·시즌 검색은 60초 동안 공유하고, 공식 ER API 호출 시작 간격 1.1초를 사이트 전체에서 관리합니다.
+- 검색은 IP별 분당 6회, 다음 경기 페이지는 60회, 리뷰는 3회입니다. 사이트 전체 제한과 리뷰 동시 2개 제한도 적용합니다.
+- 유료 AI 리뷰는 UTC 하루 전체 건수와 IP별 최대 10회 제한을 적용합니다. 실패·중단된 시도도 집계하며 금액 기준 결제 상한을 보장하는 기능은 아닙니다.
+- 같은 ER 키로 별도 로컬 서버나 다른 배포를 동시에 조회하면 실행 환경 사이의 호출 간격은 공유되지 않습니다.
+
+로컬 공개용 검사에는 빈 키의 `cloudflare/public.env.example`을 사용합니다. 실제 키는 이 파일에 넣지 않고 Cloudflare Secret에 등록합니다. 회원 로그인과 시즌 기록의 영구 아카이브는 구현하지 않았습니다.
+
 ## 기능
 
 - 현재 닉네임 → 문자열 UID → 최근 경기 조회
@@ -133,6 +153,15 @@ app/api/config/route.ts      키 설정 여부·AI 공급자·Codex 연결 상�
 app/api/player/route.ts      전적 조회 HTTP API
 app/api/player/history/route.ts  시즌 전적 이어 불러오기 HTTP API
 app/api/review/route.ts      리뷰 HTTP API, 입력·원본 검사와 제한
+lib/server/api-handlers.ts   로컬·공개 공통 HTTP 검증·리뷰 공급자 선택
+lib/server/state-store.ts    메모리·SQLite 저장소와 원자적 페이지 저장
+lib/server/request-gate.ts   ER API 호출 간격과 대기열 제한
+lib/server/public-limits.ts  공유 요청 제한·리뷰 슬롯·AI 일일 건수
+workers/app.ts              공개 Worker 진입점·신뢰 가능한 IP 전달
+workers/public-coordinator.ts  공유 전적·API 제한 Durable Object
+cloudflare/wrangler.jsonc   공개 Worker·SQLite 바인딩·기본 분석 설정
+vite.public.config.ts       개인 환경과 분리된 공개용 빌드
+scripts/public-worker.mjs   공개 빌드·로컬 미리보기·dry-run·배포 명령
 components/dashboard-parts.tsx  경기 상세·리뷰 표시
 components/player-overview.tsx  시즌 랭크·날짜별 그래프·실험체별 성적
 components/game-image.tsx    게임 이미지·누락 시 대체 표시
@@ -154,11 +183,12 @@ tests/analysis.test.mjs      통계·연결·도구 호출 테스트
 tests/codex.test.mjs         인증·도구 실행·실패·로컬 접근 제어 테스트
 tests/player-dashboard.test.mjs  상세 지표·RP·결과 색상·시즌 랭크 테스트
 tests/season-history.test.mjs  시즌 조회·재개·중복 제거·리뷰 범위 테스트
+tests/public-server.test.mjs  SQLite 복원·원자성·공유 제한·공개 HTTP 테스트
 scripts/smoke.mjs            실행 중인 HTTP API 확인
 docs/                       개발 기록·API 조사·연결 안내 문서
 ```
 
-React 19, TypeScript, Next.js 호환 App Router(Vinext), Radix UI, Tailwind CSS, Zod, Recharts를 사용합니다. 기본 구조의 Cloudflare Worker 빌드를 유지했습니다. 데이터베이스·사이트 회원 로그인·외부 배포·설치형 프로그램은 현재 버전에 포함하지 않았습니다. Codex 계정 로그인은 로컬 리뷰 연결에 사용합니다.
+React 19, TypeScript, Next.js 호환 App Router(Vinext), Radix UI, Tailwind CSS, Zod, Recharts를 사용합니다. 공개용은 Cloudflare Workers와 Durable Object의 SQLite 저장소를 사용합니다. 사이트 회원 로그인·실제 외부 배포·설치형 프로그램은 현재 버전에 포함하지 않았습니다. Codex 계정 로그인은 로컬 리뷰 연결에 사용합니다.
 
 ## 검증
 
@@ -175,7 +205,9 @@ node scripts/smoke.mjs
 
 | 검증 범위 | 최근 확인일 | 결과 |
 | --- | --- | --- |
-| 자동 테스트·타입 검사 | 2026-09-15 | 34개 테스트와 타입 검사 통과. 실제 ER·AI API 호출 없음 |
+| 자동 테스트·타입 검사 | 2026-09-16 | 41개 테스트와 타입 검사 통과. SQLite 재연결·페이지 복원·공유 호출 제한·공개 입력 검증 포함. 실제 ER·AI API 호출 없음 |
+| lint | 2026-09-16 | 오류·경고 없이 통과 |
+| 공개용 빌드·배포 dry-run·로컬 HTTP | 2026-09-16 | 공개용 HTML·예시 20경기·기본 리뷰·입력 검증·헤더 위조 시 호출 제한·연속 오류 응답 검사 통과. 기존 로컬 서버 HTTP 회귀 검사도 통과. 실제 업로드 없음 |
 | lint·빌드·로컬 HTTP 검사 | 2026-09-14 | 시즌 조회 구현 후 통과. RP 선 연결 수정 후 타입 검사·빌드도 통과 |
 | 실제 ER API 조회 | 2026-09-14 | 닉네임·시즌 랭크 조회, 물방개 시즌 12 랭크 170경기 확보 확인 |
 | 실제 Codex 연결 | 2026-09-14 | 예시 전적을 사이트 API로 분석해 `engine=codex`와 도구 실행 확인 |
@@ -191,12 +223,12 @@ node scripts/smoke.mjs
 - 최근 90일 및 현재 닉네임 사용 기간 안에서 공식 API가 반환한 경기만 다룹니다.
 - 실제 응답의 `next`와 `?next=` 요청으로 이전 경기를 조회하는 동작을 검증했습니다. 시즌별 기록에는 기존 100경기 제한이 없으며, 개인키 호출 간격을 지키면서 끝까지 수집합니다. 경기 더 보기는 확보한 기록을 펼칩니다.
 - 상세 기록은 API의 90일·닉네임 변경 제한을 받습니다. API에서 제공하는 기록을 모두 가져와도 시즌 전체와 다를 수 있으며 과거 기록을 임의로 복원하지 않습니다. 장기 기록 보존용 데이터베이스는 아직 없습니다.
-- 조회 기록은 서버 메모리에 30분 동안 유지하며 서버 재시작 시 사라집니다. 조회 중 오류나 일시 중지 후에는 마지막 위치부터 이어서 가져올 수 있습니다. 만료 시 새로고침이 필요합니다.
+- 로컬 조회 기록은 메모리에서 마지막 조회부터 30분·최대 20개 세션을 유지하고 재시작 시 사라집니다. 공개용은 SQLite에서 30분·최대 200개 세션을 유지하여 재시작 후에도 복원합니다. 오류·일시 중지 후에는 마지막 위치부터 이어서 가져올 수 있으며, 만료·삭제된 조회는 새로고침이 필요합니다.
 - 리뷰는 선택한 시즌·모드·실험체에서 최근 최대 100경기를 분석하며, 화면과 결과에 해당 범위를 표시합니다.
 - 공식 시즌 누적 경기 수·승률·평균 TK는 표시합니다. 상세 경기의 전체 확보는 보장하지 않으며, 동티어 평균과의 비교는 제공하지 않습니다. 리뷰의 순위 구간 비교에는 양 구간에 각각 유효한 순위가 최소 3개 필요합니다.
 - 전적 수치로 동선·시야·포지셔닝·패배 원인을 확정할 수 없습니다. 리뷰의 행동 제안은 사용자가 직접 확인할 가설입니다.
 - 실험체·장비·특성·전술 스킬·티어 이미지는 공개 DAK.GG 카탈로그와 CDN을 통해 표시합니다. 이미지 누락·연결 실패는 대체 표시를 사용하며, 이름 현지화 실패 시 실험체 코드를 표시합니다. 과거 패치별 이미지·이름을 복원하지는 않습니다.
-- 요청 제한과 캐시는 서버 인스턴스 메모리 기준입니다. 외부 공개 전에는 인증·공유 호출 제한·일일 비용 한도·이용약관 및 API 사용 조건을 추가 점검해야 합니다.
+- 로컬 요청 제한은 인스턴스 기준이며 공개용은 Durable Object에서 공유합니다. 공개용 제한과 AI 일일 건수도 재시작 후 유지됩니다. 실제 Cloudflare 배포·ER 연결·동시 이용 성능은 아직 검증하지 않았습니다. 개인키의 호출량과 무료 Workers CPU 한도 때문에 많은 사용자에게 즉시 응답하는 서비스는 보장하지 않습니다.
 
 ## 개발 문서
 
@@ -204,6 +236,7 @@ node scripts/smoke.mjs
 - [개발 과정](docs/development.md)
 - [대시보드 데이터 기준](docs/research/player-dashboard.md)
 - [Codex 연결 안내](docs/codex-setup.md)
+- [Cloudflare 배포 안내](docs/cloudflare-deployment.md)
 
 ## GitHub 저장소
 
@@ -211,7 +244,7 @@ node scripts/smoke.mjs
 
 2026-09-15에 코드·문서 144개 파일을 `main`에 업로드하고 원격 커밋을 확인했습니다. 현재 작업 폴더의 `origin`도 이 저장소에 연결했습니다. 기존 GitHub README의 프로젝트명과 소개를 이 문서에 반영했으며, 기존 저장소 이력과 로컬 개발 이력을 함께 보존했습니다.
 
-이후 수정할 때는 README도 갱신한 뒤 변경 사항을 확인하고 커밋·업로드합니다. `.env`, 실행 캐시, `node_modules`, 빌드 결과는 Git에서 제외하며 키 입력용 `.env.example`만 공유합니다. GitHub 코드 업로드는 웹사이트의 외부 배포와 별개입니다.
+이후 수정할 때는 README도 갱신한 뒤 변경 사항을 확인하고 커밋·업로드합니다. `.env`, 실행 캐시, `node_modules`, 빌드 결과는 Git에서 제외하며 실제 키가 없는 `.env.example`과 `cloudflare/public.env.example`을 공유합니다. GitHub 코드 업로드는 웹사이트의 외부 배포와 별개입니다.
 
 ## 문서 유지보수
 

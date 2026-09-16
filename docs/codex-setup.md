@@ -2,6 +2,8 @@
 
 확인일: 2026-09-14. 검증한 Codex CLI는 `0.154.0-alpha.6.2`이다.
 
+2026-09-16에 [Cloudflare 공개용 설정](cloudflare-deployment.md)을 추가했다. 아래 절차는 개인 PC의 로컬 리뷰용이며 계속 사용할 수 있다. 공개용 빌드·미리보기는 이 `.env`와 브리지를 사용하지 않고 기본 분석으로 시작한다. 공개 서버에서 `AI_PROVIDER=codex`는 거부하며 로그인 정보와 브리지 토큰을 배포하지 않는다.
+
 ## 실행 흐름
 
 1. `npm run setup:codex`는 `.env`에 `AI_PROVIDER=codex`, `CODEX_BRIDGE_URL`, 무작위 `CODEX_BRIDGE_TOKEN`을 설정한다. ER 키와 OpenAI API 설정은 보존한다.
