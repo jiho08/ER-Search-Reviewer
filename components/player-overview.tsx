@@ -16,7 +16,7 @@ export function RankedCard({ player }: { player: PlayerData }) {
     <div className="section-heading"><h3>{historical ? "시즌 랭크" : "현재 랭크"}</h3><span>{rank?.seasonName ?? "시즌 확인 대기"} · 스쿼드</span></div>
     <div className="tier-identity">
       <GameImage kind="tiers" code={tier?.id ?? 0} className="tier-image" />
-      <div><p className="tier-name">{tier ? `${tier.name}${tier.division ? ` ${tier.division}` : ""}` : rank?.totalGames === 0 ? "시즌 기록 없음" : historical ? "시즌 종료 RP" : "티어 확인 대기"}</p>
+      <div><p className="tier-name">{tier ? `${tier.name}${tier.division ? ` ${tier.division}` : ""}` : rank?.totalGames === 0 ? "시즌 랭크 기록 없음" : historical ? "시즌 종료 RP" : "티어 확인 대기"}</p>
         <strong className="rp-number">{formatNumber(rank?.rp ?? null)} <small>RP</small></strong>
         {tier && <p className="tier-within">{signedNumber(tier.within)} RP {tier.division ? "· 현재 단계" : "· 미스릴 기준"}</p>}
       </div>

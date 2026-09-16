@@ -98,6 +98,7 @@ export default function Home() {
   const stats = summarize(filtered),
     characters = characterStats(player.matches),
     filteredCharacters = characterStats(filtered);
+  const noLiveMatches = player.source === "live" && player.matches.length === 0;
   const isCodex = config?.aiProvider === "codex" && config.aiConfigured;
   const isAI = isCodex || (player.source === "live" && config?.aiConfigured);
   useEffect(() => {
@@ -488,7 +489,9 @@ export default function Home() {
             </Select>
             <span className="history-status" role="status">
               {historyLoading && <LoaderCircle size={15} className="spin" />}
-              {historyLoading ? "시즌 기록 불러오는 중" : player.source === "demo" ? "가상 기록" : player.history?.exhausted ? "조회 가능한 기록을 모두 불러왔습니다" : "일부 기록을 불러왔습니다"}
+              {historyLoading ? "시즌 기록 불러오는 중" : player.source === "demo" ? "가상 기록"
+                : player.history?.exhausted ? noLiveMatches ? "조회 가능한 상세 경기가 없습니다" : "조회 가능한 상세 경기를 모두 불러왔습니다"
+                : "일부 기록을 불러왔습니다"}
               <strong>{player.matches.length.toLocaleString("ko-KR")}경기</strong>
             </span>
             {historyLoading ? <button className="history-action" onClick={stopHistory}>일시 중지</button>
@@ -592,11 +595,17 @@ export default function Home() {
                   ) : (
                     <div className="empty-state">
                       <Search size={28} />
-                      <h3>표시할 경기가 없어요</h3>
-                      <p>
-                        다른 모드나 실험체를 선택해 보세요. 실제 전적은 최근
-                        90일과 현재 닉네임 사용 기간에 한해 제공됩니다.
-                      </p>
+                      <h3>{noLiveMatches
+                        ? historyLoading ? "선택한 시즌의 경기를 확인하고 있어요"
+                          : player.history?.next ? "아직 불러온 상세 경기가 없어요" : "선택한 시즌의 상세 경기가 없어요"
+                        : "현재 필터에 해당하는 경기가 없어요"}</h3>
+                      <p>{noLiveMatches ? <>
+                        {historyLoading ? "기록을 순서대로 불러오고 있습니다."
+                          : player.history?.next ? "시즌 기록을 이어서 불러오거나, 위의 시즌 선택에서 이전 시즌을 확인해 보세요."
+                          : "위의 시즌 선택에서 이전 시즌을 확인해 보세요."}
+                        {" "}상세 경기는 최근 90일과 현재 닉네임 사용 기간에 한해 제공됩니다.
+                        이전 시즌의 누적 성적은 공식 API가 제공하는 범위에서 확인할 수 있습니다.
+                      </> : "다른 모드나 실험체를 선택해 보세요."}</p>
                     </div>
                   )}
                 </section>
@@ -660,7 +669,8 @@ export default function Home() {
                   )}
                 </button>
                 <p className="review-footnote">
-                  선택한 범위의 최근 {Math.min(filtered.length, 100)}경기를 분석합니다.{" "}
+                  {filtered.length ? <>선택한 범위의 최근 {Math.min(filtered.length, 100)}경기를 분석합니다.</>
+                    : "상세 경기를 불러온 뒤 리뷰를 만들 수 있습니다."}{" "}
                   {isCodex
                     ? "이 PC의 Codex 계정으로 분석합니다. Codex 사용 한도가 적용됩니다."
                     : config?.aiProvider === "codex" && !config.aiConfigured

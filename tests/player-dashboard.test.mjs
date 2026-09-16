@@ -141,7 +141,7 @@ test("live player joins official current season, rank and stats while retaining 
     if (url.includes("/user/games/")) return json({ code: 200, userGames: [{ gameId: 45, matchingMode: 3, matchingTeamMode: 3, seasonId: 41 }] });
     if (url.includes("/l10n/")) return json({ code: 200, data: {} });
     if (url.includes("/data/Season")) return json({ code: 200, data: [{ seasonID: 41, isCurrent: 1 }] });
-    if (url.includes("/rank/uid/uid-rank/41/3")) return json({}, 404);
+    if (url.includes("/rank/uid/uid-rank/41/3")) return json({}, 500);
     if (url.includes("/stats/uid/uid-rank/41/3")) return json({ code: 200, userStats: [{ seasonId: 41, matchingMode: 3, matchingTeamMode: 3, mmr: 6400, totalGames: 10, totalWins: 2 }] });
     throw Error(`Unexpected endpoint: ${url}`);
   });

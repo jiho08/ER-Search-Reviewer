@@ -111,7 +111,8 @@ export function normalizeSeasons(data: unknown): Season[] {
 export function normalizeRankedProfile(season: { id: number; name: string }, rankData: Raw, statsData: Raw): RankedProfile {
   const rank = isObject(rankData.userRank) ? rankData.userRank : {};
   const stats = Array.isArray(statsData.userStats) ? statsData.userStats.find((s) => isObject(s) && s.seasonId === season.id && s.matchingMode === 3 && s.matchingTeamMode === 3) ?? {} : {};
-  const totalGames = number(stats.totalGames);
+  const emptyStats = Array.isArray(statsData.userStats) && statsData.userStats.length === 0;
+  const totalGames = emptyStats ? 0 : number(stats.totalGames);
   const teamKills = number(stats.totalTeamKills);
   const percent = number(stats.rankPercent);
   return {
@@ -120,7 +121,7 @@ export function normalizeRankedProfile(season: { id: number; name: string }, ran
     rank: number(rank.rank, 1) ?? number(stats.rank, 1),
     serverRank: number(rank.serverRank, 1), serverCode: number(rank.serverCode),
     rankPercent: percent !== null && percent <= 1 ? percent * 100 : null,
-    totalGames, totalWins: number(stats.totalWins), averageRank: number(stats.averageRank, 1),
+    totalGames, totalWins: emptyStats ? 0 : number(stats.totalWins), averageRank: number(stats.averageRank, 1),
     averageTeamKills: totalGames && teamKills !== null ? teamKills / totalGames : null,
   };
 }
@@ -210,6 +211,15 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch, op
       );
     }
   }
+  async function optionalRequest(path: string): Promise<Raw | null> {
+    try { return await request(path); }
+    catch (error) {
+      // A confirmed nickname may have no recent games or no rank in a season.
+      // Only absence is optional: authentication, throttling and bad data fail.
+      if (error instanceof AppError && error.status === 404) return null;
+      throw error;
+    }
+  }
   async function characterNames(): Promise<Record<number, string>> {
     const nameCache = store.get<Cached<Record<number, string>>>("meta:names");
     if (nameCache && nameCache.until > Date.now()) return nameCache.value;
@@ -282,12 +292,12 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch, op
         "플레이어 조회 응답의 식별자를 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.",
         502,
       );
-    const response = await request(
+    const response = await optionalRequest(
       `/v1/user/games/uid/${encodeURIComponent(uid)}`,
-    );
+    ) ?? { userGames: [] };
     if (!Array.isArray(response.userGames))
       throw new AppError("경기 목록 응답 형식을 확인할 수 없습니다.", 502);
-    const names = await characterNames();
+    const names = response.userGames.length ? await characterNames() : {};
     const records: Match[] = [];
     for (const raw of response.userGames) {
       if (!isObject(raw)) continue;
@@ -310,13 +320,15 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch, op
       season = (seasonId === undefined ? seasons.find((s) => s.isCurrent) : seasons.find((s) => s.id === seasonId)) ?? null;
       if (season) {
         const results = await Promise.allSettled([
-          request(`/v1/rank/uid/${encodeURIComponent(uid)}/${season.id}/3`),
-          request(`/v2/user/stats/uid/${encodeURIComponent(uid)}/${season.id}/3`),
+          optionalRequest(`/v1/rank/uid/${encodeURIComponent(uid)}/${season.id}/3`),
+          optionalRequest(`/v2/user/stats/uid/${encodeURIComponent(uid)}/${season.id}/3`),
         ]);
         ranked = normalizeRankedProfile(season,
-          results[0].status === "fulfilled" ? results[0].value : {},
-          results[1].status === "fulfilled" ? results[1].value : {});
+          results[0].status === "fulfilled" ? results[0].value ?? {} : {},
+          results[1].status === "fulfilled" ? results[1].value ?? {} : {});
         if (results.some((r) => r.status === "rejected")) rankedNotice = "시즌 성적 일부를 불러오지 못했습니다. 전적 새로고침으로 다시 확인할 수 있어요.";
+        else if (ranked.totalGames === 0 || results.every((r) => r.status === "fulfilled" && r.value === null))
+          rankedNotice = "이 시즌에 제공되는 랭크 누적 기록이 없습니다. 다른 시즌을 선택해 확인해 주세요.";
       } else rankedNotice = "현재 시즌 정보를 확인할 수 없어 티어·시즌 성적을 표시하지 않았습니다.";
     } catch {
       rankedNotice = "시즌 성적을 불러오지 못했습니다. 최근 경기는 아래에서 확인할 수 있어요.";
@@ -338,7 +350,9 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch, op
       rankedNotice,
       seasons, season,
       history: { id: crypto.randomUUID(), next, pages: 1, exhausted: next === null },
-      notice: "최근 90일 · 현재 닉네임 사용 기간 내 제공된 경기만 표시됩니다.",
+      notice: response.userGames.length
+        ? "최근 90일 · 현재 닉네임 사용 기간 내 제공된 경기만 표시됩니다."
+        : "플레이어는 확인했지만 조회 가능한 상세 경기가 없습니다. 시즌을 선택하면 API가 제공하는 누적 성적을 확인할 수 있습니다. 상세 경기는 최근 90일 · 현재 닉네임 사용 기간으로 제한됩니다.",
     };
     store.transaction(() => {
       prune();
@@ -402,7 +416,7 @@ export function createErClient(apiKey: string, fetcher: typeof fetch = fetch, op
     if (pending) return pending;
     const job = (async () => {
       const player = entry.player;
-      const response = await request(`/v1/user/games/uid/${encodeURIComponent(player.uid)}?next=${encodeURIComponent(cursor)}`);
+      const response = await optionalRequest(`/v1/user/games/uid/${encodeURIComponent(player.uid)}?next=${encodeURIComponent(cursor)}`) ?? { userGames: [] };
       if (!Array.isArray(response.userGames)) throw new AppError("경기 목록 응답 형식을 확인할 수 없습니다.", 502);
       const records = response.userGames.flatMap((raw) => {
         const match = isObject(raw) ? normalizeMatch(raw, entry.names) : null;
